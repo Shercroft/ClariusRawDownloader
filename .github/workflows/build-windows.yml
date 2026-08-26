@@ -76,9 +76,15 @@ jobs:
           $setup = Resolve-Path dist\installer\ClariusRawDownloader-Setup.exe
           $result = Start-Process $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-" -Wait -PassThru
           if ($result.ExitCode -ne 0) { throw "Installer exited with code $($result.ExitCode)." }
+
           $installedApp = "$env:LOCALAPPDATA\Programs\ClariusRawDownloader\ClariusRawDownloader.exe"
-          & $installedApp --self-test
-          if ($LASTEXITCODE -ne 0) { throw "Installed app self-test failed." }
+
+          $selfTest = Start-Process -FilePath $installedApp -ArgumentList "--self-test" -Wait -PassThru
+          if ($selfTest.ExitCode -ne 0) { throw "Installed app self-test failed with code $($selfTest.ExitCode)." }
+
+          $browserTest = Start-Process -FilePath $installedApp -ArgumentList "--browser-self-test" -Wait -PassThru
+          if ($browserTest.ExitCode -ne 0) { throw "Installed bundled-browser self-test failed with code $($browserTest.ExitCode)." }
+
           $uninstaller = "$env:LOCALAPPDATA\Programs\ClariusRawDownloader\unins000.exe"
           $result = Start-Process $uninstaller -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait -PassThru
           if ($result.ExitCode -ne 0) { throw "Uninstaller exited with code $($result.ExitCode)." }
