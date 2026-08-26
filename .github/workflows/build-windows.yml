@@ -1,0 +1,95 @@
+name: Build Windows installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Install build dependencies
+        run: python -m pip install -r requirements-build.txt
+
+      - name: Install bundled Chromium
+        shell: pwsh
+        run: |
+          $env:PLAYWRIGHT_BROWSERS_PATH = "$pwd\.playwright-browsers"
+          $env:PLAYWRIGHT_SKIP_BROWSER_GC = "1"
+          python -m playwright install chromium
+
+      - name: Run source tests
+        run: |
+          python -m unittest discover -s tests -v
+          python app.py --self-test
+
+      - name: Build portable application
+        shell: pwsh
+        run: |
+          $env:PLAYWRIGHT_BROWSERS_PATH = "$pwd\.playwright-browsers"
+          $env:PLAYWRIGHT_SKIP_BROWSER_GC = "1"
+          python -m PyInstaller --clean --noconfirm ClariusRawDownloader.spec
+          Copy-Item USER_GUIDE.md dist\ClariusRawDownloader\USER_GUIDE.md
+
+      - name: Test packaged executable
+        run: dist\ClariusRawDownloader\ClariusRawDownloader.exe --self-test
+
+      - name: Create portable fallback ZIP
+        shell: pwsh
+        run: Compress-Archive -Path dist\ClariusRawDownloader\* -DestinationPath dist\ClariusRawDownloader-Windows.zip -CompressionLevel Optimal
+
+      - name: Install Inno Setup compiler
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build one-file Windows installer
+        shell: pwsh
+        run: |
+          $candidates = @(
+            Get-ChildItem "${env:ProgramFiles(x86)}\Inno Setup *\ISCC.exe" -ErrorAction SilentlyContinue
+            Get-ChildItem "$env:ProgramFiles\Inno Setup *\ISCC.exe" -ErrorAction SilentlyContinue
+          ) | Sort-Object FullName -Descending
+          if (-not $candidates) { throw "Inno Setup compiler was not found." }
+          & $candidates[0].FullName installer\ClariusRawDownloader.iss
+
+      - name: Install and test the final installer
+        shell: pwsh
+        run: |
+          $setup = Resolve-Path dist\installer\ClariusRawDownloader-Setup.exe
+          $result = Start-Process $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-" -Wait -PassThru
+          if ($result.ExitCode -ne 0) { throw "Installer exited with code $($result.ExitCode)." }
+          $installedApp = "$env:LOCALAPPDATA\Programs\ClariusRawDownloader\ClariusRawDownloader.exe"
+          & $installedApp --self-test
+          if ($LASTEXITCODE -ne 0) { throw "Installed app self-test failed." }
+          $uninstaller = "$env:LOCALAPPDATA\Programs\ClariusRawDownloader\unins000.exe"
+          $result = Start-Process $uninstaller -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait -PassThru
+          if ($result.ExitCode -ne 0) { throw "Uninstaller exited with code $($result.ExitCode)." }
+
+      - name: Upload end-user installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClariusRawDownloader-Installer
+          path: dist/installer/ClariusRawDownloader-Setup.exe
+          if-no-files-found: error
+
+      - name: Upload portable fallback
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClariusRawDownloader-Portable
+          path: dist/ClariusRawDownloader-Windows.zip
+          if-no-files-found: error
