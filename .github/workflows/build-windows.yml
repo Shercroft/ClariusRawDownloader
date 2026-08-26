@@ -65,7 +65,10 @@ jobs:
             Get-ChildItem "$env:ProgramFiles\Inno Setup *\ISCC.exe" -ErrorAction SilentlyContinue
           ) | Sort-Object FullName -Descending
           if (-not $candidates) { throw "Inno Setup compiler was not found." }
-          & $candidates[0].FullName installer\ClariusRawDownloader.iss
+          $compiler = $candidates[0].FullName
+          $installerScript = (Resolve-Path "installer\ClariusRawDownloader.iss").Path
+          & $compiler $installerScript
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed with code $LASTEXITCODE." }
 
       - name: Install and test the final installer
         shell: pwsh
