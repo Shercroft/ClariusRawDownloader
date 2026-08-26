@@ -1,10 +1,10 @@
 # Clarius RAW Data Downloader — User Guide
 
 This program downloads and tracks RAW archives from Clarius Cloud. The Windows
-installer includes the application runtime and browser: the operator does
-**not** need Python and should never edit source code.
+installer and macOS disk image include the application runtime and browser: the
+operator does **not** need Python and should never edit source code.
 
-## First-time setup
+## Windows first-time setup
 
 1. Copy `ClariusRawDownloader-Setup.exe` to the computer that will perform the
    downloads.
@@ -25,6 +25,21 @@ placing it in the new app's state folder.
 The **download folder** may be local, a mapped drive, or an approved network
 location, provided the operator has write access. Uninstalling the app does not
 delete downloaded study data or synchronization logs stored there.
+
+## macOS first-time setup
+
+1. Choose the correct download using **Apple menu → About This Mac**:
+   - Apple M1/M2/M3/M4 or later Apple-series chip: use the Apple Silicon DMG.
+   - Intel processor: use the Intel DMG.
+2. Open the corresponding `ClariusRawDownloader-macOS-….dmg`.
+3. Drag `ClariusRawDownloader.app` into the **Applications** shortcut.
+4. Open **Clarius RAW Data Downloader** from Applications.
+
+An internally built DMG is ad-hoc signed unless the institution supplies an
+Apple Developer ID certificate and notarizes it. On first launch, macOS may ask
+the operator to confirm the app. Only approve it after verifying that the DMG
+came from the research team. Institutionally signed and notarized releases are
+recommended for routine handoff.
 
 ## Required first test
 
@@ -111,11 +126,13 @@ Common issues:
 
 ## Handoff acceptance checklist
 
-Before relying on the app for research data collection, test the final installer
-on a Windows computer that does not have Python installed:
+Before relying on the app for research data collection, test each operating-
+system download on a computer that does not have Python installed:
 
 - `ClariusRawDownloader-Setup.exe` installs without Python.
 - The app opens from the Start menu and desktop shortcut.
+- The appropriate macOS DMG opens, the app copies to Applications, and the app
+  launches on the matching Intel or Apple Silicon architecture.
 - Password text is hidden and is absent after closing/reopening the app.
 - A known one-patient range downloads the expected captures.
 - Repeating that range skips existing non-empty TARs.

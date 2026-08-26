@@ -23,7 +23,7 @@ from typing import Any
 
 
 APP_NAME = "Clarius RAW Data Downloader"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 SETTINGS_FILENAME = "settings.json"
 
 
@@ -31,6 +31,8 @@ def application_data_dir() -> Path:
     """Return a per-user, writable folder for non-sensitive app settings."""
     if sys.platform == "win32":
         base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
     else:
         base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     return base / "UnityHealth" / "ClariusRawDownloader"
@@ -97,10 +99,22 @@ def runtime_state_paths(output_folder: str, archived: bool = False) -> tuple[Pat
 def configure_bundled_browser() -> None:
     """Point Playwright at the Chromium folder included by PyInstaller."""
     bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-    bundled_browser = bundle_root / "ms-playwright"
-    if bundled_browser.is_dir():
-        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(bundled_browser)
-        os.environ["PLAYWRIGHT_SKIP_BROWSER_GC"] = "1"
+    executable = Path(sys.executable).resolve()
+    candidates = [
+        bundle_root / "ms-playwright",
+        bundle_root.parent / "Resources" / "ms-playwright",
+        executable.parent / "_internal" / "ms-playwright",
+    ]
+    # A macOS .app executable lives in App.app/Contents/MacOS; PyInstaller
+    # relocates data files to App.app/Contents/Resources.
+    if len(executable.parents) >= 2:
+        candidates.append(executable.parents[1] / "Resources" / "ms-playwright")
+
+    for bundled_browser in candidates:
+        if bundled_browser.is_dir():
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(bundled_browser)
+            os.environ["PLAYWRIGHT_SKIP_BROWSER_GC"] = "1"
+            return
 
 
 def apply_engine_settings(core: Any, settings: AppSettings, password: str) -> None:
@@ -794,9 +808,29 @@ def self_test() -> int:
     return 0
 
 
+def browser_self_test() -> int:
+    """Launch the bundled Chromium without contacting Clarius."""
+    configure_bundled_browser()
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_content("<html><head><title>Clarius App Test</title></head></html>")
+            if page.title() != "Clarius App Test":
+                raise RuntimeError("Bundled Chromium returned an unexpected page title.")
+        finally:
+            browser.close()
+    print(f"{APP_NAME} {APP_VERSION} bundled-browser self-test: PASS")
+    return 0
+
+
 def main() -> int:
     if "--self-test" in sys.argv:
         return self_test()
+    if "--browser-self-test" in sys.argv:
+        return browser_self_test()
 
     configure_bundled_browser()
     import tkinter as tk

@@ -43,9 +43,9 @@ The publisher should submit the signed installer generated from this project.
 
 ## Apple App Store
 
-The current deliverable targets 64-bit Windows. A macOS App Store release would
-be a separate product build requiring macOS packaging, Apple code signing and
-notarization, an Apple Developer account, sandbox/entitlement review, and
-separate testing of the bundled browser. It is not produced by the Windows
-installer workflow.
-
+The project now produces direct-download Intel and Apple Silicon macOS DMGs.
+These are not Mac App Store submissions. A Mac App Store release would still
+require an Apple Developer account, approved bundle identity, distribution
+certificates and provisioning, sandbox/entitlement review, notarization, Store
+metadata, and review of whether the bundled Playwright Chromium runtime is
+compatible with the App Store sandbox. Institutional approval is required.

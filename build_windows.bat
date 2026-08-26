@@ -42,6 +42,8 @@ if errorlevel 1 goto :failed
 copy /Y "USER_GUIDE.md" "dist\ClariusRawDownloader\USER_GUIDE.md" >nul
 "dist\ClariusRawDownloader\ClariusRawDownloader.exe" --self-test
 if errorlevel 1 goto :failed
+"dist\ClariusRawDownloader\ClariusRawDownloader.exe" --browser-self-test
+if errorlevel 1 goto :failed
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "if (Test-Path 'dist\ClariusRawDownloader-Windows.zip') { Remove-Item 'dist\ClariusRawDownloader-Windows.zip' -Force }; Compress-Archive -Path 'dist\ClariusRawDownloader\*' -DestinationPath 'dist\ClariusRawDownloader-Windows.zip' -CompressionLevel Optimal"

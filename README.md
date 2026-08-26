@@ -1,9 +1,8 @@
 # Clarius RAW Data Downloader
 
-A Windows desktop interface around the existing Clarius Playwright downloader.
-The end-user deliverable is `ClariusRawDownloader-Setup.exe`, an offline installer
-containing Python, Playwright, and Chromium. The end user does not install Python
-or edit code.
+A Windows and macOS desktop interface around the existing Clarius Playwright
+downloader. End-user downloads contain Python, Playwright, and Chromium. The
+operator does not install Python or edit code.
 
 ## What changed from the original script
 
@@ -20,11 +19,20 @@ The existing exam enumeration, date resolution, stable capture mapping,
 resume/overwrite behavior, and conservative `last_sync` rules remain in
 `clarius_downloader_core.py`.
 
-## Preferred build: no local Python
+## End-user downloads
+
+| Computer | Download |
+| --- | --- |
+| Windows 64-bit | `ClariusRawDownloader-Setup.exe` |
+| Apple Silicon Mac | `ClariusRawDownloader-macOS-Apple-Silicon.dmg` |
+| Intel Mac | `ClariusRawDownloader-macOS-Intel.dmg` |
+
+## Preferred builds: no local Python
 
 Follow `CLOUD_BUILD.md`. The included private GitHub Actions workflow uses a
 temporary Windows build computer and produces the end-user artifact
-`ClariusRawDownloader-Setup.exe`. Neither the maintainer nor Lynn needs Python.
+the Windows installer and both architecture-specific macOS DMGs. Neither the
+maintainer nor Lynn needs Python.
 
 ## Local maintainer build
 
@@ -77,10 +85,13 @@ Playwright/Chromium installation in `requirements-build.txt`.
 | `app.py` | tkinter GUI, settings, thread/log bridge, validation, and self-test |
 | `clarius_downloader_core.py` | Existing Clarius download engine with credentials removed and safe-stop checks added |
 | `ClariusRawDownloader.spec` | PyInstaller one-folder build including Playwright and Chromium |
+| `ClariusRawDownloader-macos.spec` | PyInstaller macOS `.app` build including Playwright and Chromium |
 | `build_windows.bat` | Repeatable Windows build and packaged smoke test |
 | `installer/ClariusRawDownloader.iss` | One-file Windows installer definition |
 | `USER_GUIDE.md` | Operator instructions and handoff acceptance checklist |
 | `CLOUD_BUILD.md` | Build the installer without installing Python locally |
 | `STORE_SUBMISSION.md` | Store/account/signing handoff requirements |
+| `MACOS_SIGNING.md` | Optional Developer ID signing and notarization setup |
 | `tests/test_app.py` | Offline configuration/security tests |
 | `.github/workflows/build-windows.yml` | Windows cloud build producing the installer |
+| `.github/workflows/build-macos.yml` | Apple Silicon and Intel Mac cloud builds producing DMGs |
