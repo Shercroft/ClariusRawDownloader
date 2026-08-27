@@ -220,7 +220,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 from playwright.sync_api import TimeoutError as PWTimeout
@@ -314,12 +314,23 @@ AUTO_RENAME_UNKDATE_FOLDER = True
 
 # Additional date fallbacks for the updated Clarius UI/API.
 # 1) Recursively inspect nested exam JSON fields for date-like values.
-# 2) If the exam list still has no date, inspect capture metadata and use the
-#    earliest plausible acquisition/creation date for FOLDER NAMING ONLY.
-#    This capture-derived date is not used to decide whether an exam is newer
-#    than last_sync.json, because an exam may be uploaded later than acquired.
+# 2) If the exam list still has no trustworthy date, inspect capture metadata.
+#
+# IMPORTANT: normal sync must NEVER treat an unreadable date as automatically
+# new. That behavior can redownload old exams. Nested/capture timestamps with a
+# sufficiently specific date key are therefore allowed to decide the
+# last_sync boundary when the top-level API/detail page omits its date.
 USE_NESTED_JSON_DATE_FALLBACK = True
 USE_CAPTURE_DATE_FOR_FOLDER_NAME = True
+USE_CAPTURE_DATE_FOR_SYNC_FILTER = True
+MIN_SYNC_DATE_FALLBACK_SCORE = 60
+
+# Defense in depth for client-rendered pages. A bad DOM selector can sometimes
+# land on the page's live/current timestamp. If that timestamp is within this
+# many minutes of the downloader clock but conflicts strongly with a trusted
+# JSON date, reject it rather than making an old exam look newly created.
+DETAIL_PAGE_CLOCK_GUARD_MINUTES = 5
+DETAIL_PAGE_CONFLICT_DAYS = 1
 
 # When True, log which JSON key/path supplied a fallback date. This is useful
 # for the first small-range test and can be turned off after validation.
@@ -1473,31 +1484,40 @@ def enumerate_exams_html(page, last_sync_dt, stop_at_last_sync=True):
 
 
 def try_read_detail_date(page, labels):
-    """Read a labelled date from the exam detail page.
+    """Read a *labelled* date from the exam detail page.
 
-    Supports definition lists, sibling divs, and the two-column label/value
-    layout currently used by Clarius (for example, "Exam Date:" followed by
-    "08/07/2025 8:50 AM").
+    Only exact label matches are accepted. Earlier versions also used a broad
+    ``contains(...)/following::*[1]`` XPath. On the 2026 Clarius UI that XPath
+    can match a large ancestor containing the words "Exam Date" and then read
+    an unrelated live/current timestamp. The result is especially dangerous in
+    normal sync because an old exam can suddenly appear newer than last_sync.
     """
     for label in labels:
         selectors = [
             f"xpath=//dt[normalize-space(.)='{label}' or normalize-space(.)='{label}:']/following-sibling::dd[1]",
             f"xpath=//*[normalize-space(.)='{label}' or normalize-space(.)='{label}:']/following-sibling::*[1]",
-            f"xpath=//*[normalize-space(.)='{label}' or normalize-space(.)='{label}:']/parent::*/*[last()]",
-            f"xpath=//*[contains(normalize-space(.), '{label}')]/following::*[1]",
         ]
         for selector in selectors:
             try:
                 loc = page.locator(selector)
-                if loc.count() > 0:
-                    raw = loc.first.inner_text().strip()
-                    parsed = try_parse_date(raw)
-                    if parsed is not None:
-                        return parsed
+                if loc.count() <= 0:
+                    continue
+                raw = loc.first.inner_text().strip()
+                if not raw or len(raw) > 120 or "\n" in raw:
+                    continue
+                parsed = try_parse_date(raw)
+                if parsed is not None:
+                    if DEBUG_DATE_RESOLUTION:
+                        log(
+                            f"[DATE DEBUG] Exact detail label {label!r} -> "
+                            f"{parsed} from raw={raw!r}"
+                        )
+                    return parsed
             except Exception:
                 pass
 
-    # Text-line fallback for layouts where label and value are separate rows.
+    # Text-line fallback for layouts where the exact label and value are
+    # separate rows. Again, only exact label lines are accepted.
     try:
         body_text = page.locator("body").inner_text()
         lines = [line.strip() for line in body_text.splitlines() if line.strip()]
@@ -1510,8 +1530,15 @@ def try_read_detail_date(page, labels):
             if normalized_line not in normalized_labels:
                 continue
             for candidate in lines[i + 1 : i + 4]:
+                if len(candidate) > 120:
+                    continue
                 parsed = try_parse_date(candidate)
                 if parsed is not None:
+                    if DEBUG_DATE_RESOLUTION:
+                        log(
+                            f"[DATE DEBUG] Detail text-line label {line!r} -> "
+                            f"{parsed} from raw={candidate!r}"
+                        )
                     return parsed
     except Exception:
         pass
@@ -1648,6 +1675,38 @@ def _template_from_successful_detail_url(url, exam_id):
     return url.replace(exam_text, "{exam_id}", 1)
 
 
+def _trusted_nested_sync_date(record):
+    """Return a nested JSON date only when its key is specific enough."""
+    dt = record.get("nested_date_dt")
+    score = record.get("nested_date_score")
+    if dt is None or score is None or score < MIN_SYNC_DATE_FALLBACK_SCORE:
+        return None
+    return dt
+
+
+def _trusted_capture_sync_date(capture_dt, capture_score):
+    if (
+        not USE_CAPTURE_DATE_FOR_SYNC_FILTER
+        or capture_dt is None
+        or capture_score is None
+        or capture_score < MIN_SYNC_DATE_FALLBACK_SCORE
+    ):
+        return None
+    return capture_dt
+
+
+def _detail_date_conflicts_with_trusted_json(detail_dt, record):
+    """Detect the characteristic 'page clock parsed as Exam Date' failure."""
+    nested_dt = _trusted_nested_sync_date(record)
+    if detail_dt is None or nested_dt is None:
+        return False
+
+    now = datetime.now()
+    near_now = abs(detail_dt - now) <= timedelta(minutes=DETAIL_PAGE_CLOCK_GUARD_MINUTES)
+    conflicts = abs(detail_dt - nested_dt) >= timedelta(days=DETAIL_PAGE_CONFLICT_DAYS)
+    return near_now and conflicts
+
+
 def hydrate_api_record_from_direct_detail_page(page, record):
     """Try direct exam-detail URLs and read Exam Date without list scanning."""
     global _DISCOVERED_EXAM_DETAIL_URL_TEMPLATE
@@ -1683,6 +1742,22 @@ def hydrate_api_record_from_direct_detail_page(page, record):
                 page,
                 ["Upload Date", "Uploaded", "Created"],
             )
+
+            if _detail_date_conflicts_with_trusted_json(exam_dt, record):
+                log(
+                    f"[WARN] Rejected suspicious Exam Date for {patient_id}: "
+                    f"{exam_dt}; trusted nested JSON date is "
+                    f"{_trusted_nested_sync_date(record)}."
+                )
+                exam_dt = None
+
+            if _detail_date_conflicts_with_trusted_json(upload_dt, record):
+                log(
+                    f"[WARN] Rejected suspicious Upload/Created date for {patient_id}: "
+                    f"{upload_dt}; trusted nested JSON date is "
+                    f"{_trusted_nested_sync_date(record)}."
+                )
+                upload_dt = None
 
             if exam_dt is None and upload_dt is None:
                 if DEBUG_DATE_RESOLUTION:
@@ -2142,14 +2217,17 @@ def download_raw_capture(download_page, capture_uuid, destination_path):
 
 
 def exam_is_new_enough(record, last_sync_dt):
+    """Conservative date predicate used by callers/tests.
+
+    Unknown dates are NOT automatically new. ``process_exam`` performs the
+    richer nested/capture fallback before making its final decision.
+    """
     if range_mode_enabled():
         return in_patient_range(record.get("patient_id"))
 
-    upload_dt = record.get("upload_dt")
+    upload_dt = record.get("upload_dt") or _trusted_nested_sync_date(record)
     if upload_dt is None:
-        # Preserve the original behavior: process unreadable dates rather than
-        # silently losing a potentially new exam.
-        return True
+        return False
     return upload_dt > last_sync_dt
 
 
@@ -2184,34 +2262,86 @@ def process_exam(page, download_page, api_ctx, record, last_sync_dt, processed_e
     if range_mode_enabled() and not in_patient_range(patient_id):
         return False, True
 
-    # API list responses may omit dates. Resolve the real Exam Date from the
-    # matching HTML detail page before last_sync filtering or folder naming.
+    # API list responses may omit dates. First try the *strictly labelled*
+    # detail-page fields. If those are unavailable, use trusted nested JSON.
+    # Only if both fail do we fetch capture metadata before deciding whether
+    # the exam is newer than last_sync.
     if record.get("upload_dt") is None:
         record = hydrate_missing_api_date_from_html(page, record)
         patient_id = record.get("patient_id") or patient_id
 
-    if not exam_is_new_enough(record, last_sync_dt) and not should_force_exam(patient_id):
-        log(f"[SKIP] Exam older than last_sync: {patient_id} ({record.get('upload_dt')})")
-        return False, True
+    sync_filter_dt = record.get("upload_dt") or _trusted_nested_sync_date(record)
+    sync_filter_source = (
+        "top-level/detail date"
+        if record.get("upload_dt") is not None
+        else "nested exam JSON" if sync_filter_dt is not None
+        else None
+    )
+
+    exam_id = None
+    captures = None
+    capture_date_dt = None
+    capture_date_path = None
+    capture_score = None
+
+    # If normal sync still has no trustworthy date, inspect capture metadata
+    # BEFORE making the last_sync decision. This prevents the old behavior
+    # where date=None was automatically treated as new.
+    if not range_mode_enabled() and sync_filter_dt is None:
+        exam_id = resolve_exam_id(api_ctx, record)
+        captures = get_all_captures(api_ctx, exam_id)
+        if captures:
+            capture_date_dt, capture_date_path, capture_raw, capture_score = (
+                best_date_from_captures(captures)
+            )
+            trusted_capture_dt = _trusted_capture_sync_date(
+                capture_date_dt, capture_score
+            )
+            if trusted_capture_dt is not None:
+                sync_filter_dt = trusted_capture_dt
+                sync_filter_source = "capture metadata"
+            if capture_date_dt is not None and DEBUG_DATE_RESOLUTION:
+                log(
+                    f"[DATE DEBUG] Capture fallback for {patient_id}: "
+                    f"{capture_date_dt} from {capture_date_path} "
+                    f"(score={capture_score}, raw={capture_raw!r})"
+                )
+
+    force_this_exam = should_force_exam(patient_id)
+    if not range_mode_enabled() and not force_this_exam:
+        if sync_filter_dt is None:
+            log(
+                f"[WARN] Cannot safely determine whether {patient_id} is newer "
+                f"than last_sync={last_sync_dt}. No folder/download will be "
+                "created, and last_sync will not advance."
+            )
+            # selected=True + ok=False deliberately blocks state advancement;
+            # this is safer than silently missing a genuinely new undated exam.
+            return True, False
+        if sync_filter_dt <= last_sync_dt:
+            log(
+                f"[SKIP] Exam older than last_sync: {patient_id} "
+                f"({sync_filter_dt}, source={sync_filter_source})"
+            )
+            return False, True
 
     selected_as_new = True
-    upload_dt = record.get("upload_dt")
+    upload_dt = record.get("upload_dt") or sync_filter_dt
 
     # Resolve exam_id and fetch capture metadata before creating the folder.
-    # This allows capture acquisition/creation timestamps to repair folder
-    # names when the new Clarius exam-list API omits Exam Date.
-    exam_id = resolve_exam_id(api_ctx, record)
+    # Reuse metadata already fetched for the normal-sync date decision.
+    if exam_id is None:
+        exam_id = resolve_exam_id(api_ctx, record)
     if exam_id in processed_exam_ids:
         log(f"[SKIP] exam_id={exam_id} was already processed in this run.")
         return selected_as_new, True
     processed_exam_ids.add(exam_id)
 
-    captures = get_all_captures(api_ctx, exam_id)
+    if captures is None:
+        captures = get_all_captures(api_ctx, exam_id)
     reported_captures = record.get("reported_captures")
 
-    capture_date_dt = None
-    capture_date_path = None
-    if USE_CAPTURE_DATE_FOR_FOLDER_NAME and captures:
+    if capture_date_dt is None and USE_CAPTURE_DATE_FOR_FOLDER_NAME and captures:
         capture_date_dt, capture_date_path, capture_raw, capture_score = (
             best_date_from_captures(captures)
         )
@@ -2265,7 +2395,6 @@ def process_exam(page, download_page, api_ctx, record, last_sync_dt, processed_e
         folder_dt,
     )
 
-    force_this_exam = should_force_exam(patient_id)
     if (
         SKIP_EXISTING_STUDY_FOLDER
         and folder_has_any_content(study_path)
