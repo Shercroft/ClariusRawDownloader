@@ -1,5 +1,5 @@
 #define MyAppName "Clarius RAW Data Downloader"
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.2.1"
 #define MyAppPublisher "Kidney Ultrasound Research Team"
 #define MyAppExeName "ClariusRawDownloader.exe"
 
