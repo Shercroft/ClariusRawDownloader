@@ -1,0 +1,52 @@
+name: Publish existing Mac builds to Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Run ID of the successful Build macOS apps workflow"
+        required: true
+      release_tag:
+        description: "Release tag, e.g. v1.2.4"
+        required: true
+        default: "v1.2.4"
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download Apple Silicon artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ClariusRawDownloader-macOS-Apple-Silicon
+          path: mac/apple
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.run_id }}
+
+      - name: Download Intel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ClariusRawDownloader-macOS-Intel
+          path: mac/intel
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.run_id }}
+
+      - name: Show downloaded files
+        run: find mac -type f -maxdepth 3 -print
+
+      - name: Upload DMGs to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            mac/apple/*.dmg \
+            mac/intel/*.dmg \
+            --clobber
