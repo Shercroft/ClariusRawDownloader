@@ -7,19 +7,15 @@ from PyInstaller.utils.hooks import collect_all
 
 
 project_root = Path(SPECPATH)
-browser_root_text = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
-if not browser_root_text:
-    raise SystemExit(
-        "PLAYWRIGHT_BROWSERS_PATH must point to the Chromium folder created by "
-        "'python -m playwright install chromium'. Use the macOS cloud workflow."
-    )
 
-browser_root = Path(browser_root_text)
-if not browser_root.is_dir():
-    raise SystemExit(f"Bundled browser folder does not exist: {browser_root}")
-
+# IMPORTANT:
+# Chromium is intentionally NOT added to Analysis/datas on macOS. Modern
+# Playwright Chromium contains nested signed .app bundles and Mach-O binaries.
+# If those files are handed to PyInstaller, PyInstaller tries to post-process
+# and ad-hoc re-sign them, which can fail during COLLECT (especially on Intel
+# runners). The GitHub Actions workflow copies the untouched browser tree into
+# App.app/Contents/Resources/ms-playwright after PyInstaller finishes.
 playwright_datas, playwright_binaries, playwright_hiddenimports = collect_all("playwright")
-playwright_datas.append((str(browser_root), "ms-playwright"))
 signing_identity = os.environ.get("MACOS_CODESIGN_IDENTITY", "").strip() or None
 
 a = Analysis(
