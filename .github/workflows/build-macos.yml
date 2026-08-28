@@ -46,6 +46,8 @@ jobs:
 
       - name: Install architecture-matched Chromium
         run: |
+          echo "PLAYWRIGHT_BROWSERS_PATH=$PWD/.playwright-browsers" >> "$GITHUB_ENV"
+          echo "PLAYWRIGHT_SKIP_BROWSER_GC=1" >> "$GITHUB_ENV"
           export PLAYWRIGHT_BROWSERS_PATH="$PWD/.playwright-browsers"
           export PLAYWRIGHT_SKIP_BROWSER_GC=1
           python -m playwright install chromium
@@ -72,20 +74,39 @@ jobs:
 
       - name: Build macOS application bundle
         run: |
-          export PLAYWRIGHT_BROWSERS_PATH="$PWD/.playwright-browsers"
-          export PLAYWRIGHT_SKIP_BROWSER_GC=1
           python -m PyInstaller --clean --noconfirm ClariusRawDownloader-macos.spec
 
-      - name: Apply hardened Developer ID signature when configured
-        if: ${{ env.MACOS_CODESIGN_IDENTITY != '' }}
+      - name: Add bundled Chromium without PyInstaller rewriting it
         run: |
-          codesign \
-            --force \
-            --deep \
-            --options runtime \
-            --timestamp \
-            --sign "$MACOS_CODESIGN_IDENTITY" \
-            dist/ClariusRawDownloader.app
+          set -euo pipefail
+          BROWSER_DEST="dist/ClariusRawDownloader.app/Contents/Resources/ms-playwright"
+          test -d "$PLAYWRIGHT_BROWSERS_PATH"
+          rm -rf "$BROWSER_DEST"
+          mkdir -p "$(dirname "$BROWSER_DEST")"
+          ditto "$PLAYWRIGHT_BROWSERS_PATH" "$BROWSER_DEST"
+          test -d "$BROWSER_DEST"
+
+      - name: Sign final application bundle
+        run: |
+          set -euo pipefail
+          if [ -n "${MACOS_CODESIGN_IDENTITY:-}" ]; then
+            # PyInstaller already signed our executable with this identity.
+            # Sign the outer bundle after adding Chromium, but do not --deep
+            # re-sign Playwright's nested Chrome for Testing application.
+            codesign \
+              --force \
+              --options runtime \
+              --timestamp \
+              --sign "$MACOS_CODESIGN_IDENTITY" \
+              dist/ClariusRawDownloader.app
+          else
+            # Adding Resources changes the bundle seal, so refresh the outer
+            # ad-hoc signature while preserving Chromium's own nested signing.
+            codesign \
+              --force \
+              --sign - \
+              dist/ClariusRawDownloader.app
+          fi
 
       - name: Test packaged application bundle
         run: |
@@ -111,11 +132,11 @@ jobs:
             -format UDZO \
             "dist/$DMG_NAME"
 
-          if [ -n "$MACOS_CODESIGN_IDENTITY" ]; then
+          if [ -n "${MACOS_CODESIGN_IDENTITY:-}" ]; then
             codesign --force --timestamp --sign "$MACOS_CODESIGN_IDENTITY" "dist/$DMG_NAME"
           fi
 
-          if [ -n "$MACOS_CODESIGN_IDENTITY" ] && [ -n "$APPLE_ID" ] && [ -n "$APPLE_APP_SPECIFIC_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+          if [ -n "${MACOS_CODESIGN_IDENTITY:-}" ] && [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ]; then
             xcrun notarytool submit "dist/$DMG_NAME" \
               --apple-id "$APPLE_ID" \
               --password "$APPLE_APP_SPECIFIC_PASSWORD" \
