@@ -49,4 +49,5 @@ jobs:
           gh release upload "$RELEASE_TAG" \
             mac/apple/*.dmg \
             mac/intel/*.dmg \
+            --repo "$GITHUB_REPOSITORY" \
             --clobber
