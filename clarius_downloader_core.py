@@ -312,6 +312,13 @@ DISABLE_HTML_TABLE_FALLBACK_AFTER_FIRST_FAILURE = True
 # Rename an existing ..._UNKDATE-... folder after the real date is found.
 AUTO_RENAME_UNKDATE_FOLDER = True
 
+# Also repair a uniquely matched study folder whose embedded date is wrong.
+# This specifically fixes folders created by older builds that used an
+# uploaded_at/download-day timestamp (for example Aug_28) instead of the Cloud
+# Exam Date (for example Aug_21). The patient/exam/visit prefix must match
+# uniquely; ambiguous multiple folders are never renamed automatically.
+AUTO_RENAME_MISMATCHED_DATE_FOLDER = True
+
 # Additional date fallbacks for the updated Clarius UI/API.
 # 1) Recursively inspect nested exam JSON fields for date-like values.
 # 2) If the exam list still has no trustworthy date, inspect capture metadata.
@@ -323,7 +330,11 @@ AUTO_RENAME_UNKDATE_FOLDER = True
 USE_NESTED_JSON_DATE_FALLBACK = True
 USE_CAPTURE_DATE_FOR_FOLDER_NAME = True
 USE_CAPTURE_DATE_FOR_SYNC_FILTER = True
-MIN_SYNC_DATE_FALLBACK_SCORE = 60
+# Only clinically meaningful keys (performed/study/capture/acquired/exam date)
+# may decide normal sync or folder naming when the labelled Cloud Exam Date is
+# unavailable. Generic created/uploaded timestamps are intentionally excluded.
+MIN_SYNC_DATE_FALLBACK_SCORE = 100
+MIN_FOLDER_DATE_FALLBACK_SCORE = 100
 
 # Defense in depth for client-rendered pages. A bad DOM selector can sometimes
 # land on the page's live/current timestamp. If that timestamp is within this
@@ -418,7 +429,23 @@ EXAM_PATIENT_KEYS = [
 ]
 EXAM_STATUS_KEYS = ["status", "exam_status"]
 EXAM_CAPTURE_COUNT_KEYS = ["number_of_captures", "capture_count", "num_captures"]
-EXAM_DATE_KEYS = [
+# Keep the clinical Exam Date separate from upload/creation timestamps.
+# Folder names and the normal-sync boundary should use the clinical exam date
+# whenever it is available. Upload/created timestamps are only fallbacks.
+EXAM_CLINICAL_DATE_KEYS = [
+    "exam_date",
+    "examDate",
+    "study_date",
+    "studyDate",
+    "acquired_at",
+    "acquiredAt",
+    "acquisition_date",
+    "acquisitionDate",
+    "performed_at",
+    "performedAt",
+]
+
+EXAM_UPLOAD_DATE_KEYS = [
     "uploaded_at",
     "uploadedAt",
     "upload_date",
@@ -429,9 +456,6 @@ EXAM_DATE_KEYS = [
     "created",
     "date_created",
     "dateCreated",
-    "exam_date",
-    "examDate",
-    "date",
     "completed_at",
     "completedAt",
 ]
@@ -558,7 +582,11 @@ def try_parse_date(text):
         "%Y-%m-%d %H:%M",
         "%Y-%m-%d",
         "%m/%d/%Y %I:%M %p",
+        "%m/%d/%Y, %I:%M %p",
+        "%m/%d/%y %I:%M %p",
+        "%m/%d/%y, %I:%M %p",
         "%m/%d/%Y",
+        "%m/%d/%y",
         "%d %B %Y %I:%M %p",
         "%d %B %Y %H:%M",
         "%B %d %Y %I:%M %p",
@@ -610,7 +638,7 @@ def extract_date_candidates_from_text(text):
         r"[A-Za-z]{3,9}\.? \d{1,2}, \d{4}",
         r"\d{1,2} [A-Za-z]{3,9} \d{4}",
         r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?",
-        r"\d{1,2}/\d{1,2}/\d{4}(?: \d{1,2}:\d{2}(?: ?[APMapm]{2})?)?",
+        r"\d{1,2}/\d{1,2}/\d{2,4}(?:,? \d{1,2}:\d{2}(?: ?[APMapm]{2})?)?",
     ]
 
     found = []
@@ -916,7 +944,16 @@ def find_existing_study_folders(master_folder, patient_id):
 
 
 def get_or_create_study_path(master_folder, patient_id, folder_date):
-    """Use the correctly dated path and rename an old UNKDATE folder safely."""
+    """Return the path for one patient/exam/visit, repairing stale date names.
+
+    If a trustworthy clinical date is known, the desired folder name is the
+    canonical name. A *single* existing folder with the same patient/exam/visit
+    prefix is renamed to that canonical name when necessary. This repairs
+    folders produced by older versions that used upload/download timestamps.
+
+    If multiple mismatched folders exist, the function refuses to guess rather
+    than silently reusing the wrong folder.
+    """
     desired_name = build_study_folder(patient_id, folder_date)
     desired_path = os.path.join(master_folder, desired_name)
     matches = find_existing_study_folders(master_folder, patient_id)
@@ -924,22 +961,46 @@ def get_or_create_study_path(master_folder, patient_id, folder_date):
     if os.path.isdir(desired_path):
         return desired_path
 
-    if folder_date is not None and AUTO_RENAME_UNKDATE_FOLDER:
-        unknown_matches = [
-            path for path in matches if "_UNKDATE-" in os.path.basename(path)
-        ]
-        if len(unknown_matches) == 1:
-            old_path = unknown_matches[0]
+    # With a known clinical date, a single same-visit folder is safe to repair.
+    if folder_date is not None and len(matches) == 1:
+        old_path = matches[0]
+        old_name = os.path.basename(old_path)
+        is_unkdate = "_UNKDATE-" in old_name
+        may_rename = (
+            (is_unkdate and AUTO_RENAME_UNKDATE_FOLDER)
+            or (not is_unkdate and AUTO_RENAME_MISMATCHED_DATE_FOLDER)
+        )
+        if may_rename and os.path.normcase(old_path) != os.path.normcase(desired_path):
             try:
                 os.rename(old_path, desired_path)
-                log(f"[RENAMED] {old_path} -> {desired_path}")
+                reason = "UNKDATE" if is_unkdate else "mismatched date"
+                log(f"[RENAMED] Corrected {reason} folder: {old_path} -> {desired_path}")
                 return desired_path
             except Exception as e:
-                log(f"[WARN] Could not rename UNKDATE folder: {e}")
+                raise RuntimeError(
+                    f"Found one existing folder for {patient_id}, but it could not "
+                    f"be renamed to the verified Exam Date path. Existing={old_path}; "
+                    f"desired={desired_path}; error={e}"
+                ) from e
 
-    if matches:
-        log(f"[INFO] Reusing existing study folder: {matches[0]}")
+    if folder_date is not None and len(matches) > 1:
+        raise RuntimeError(
+            f"Multiple existing folders match {patient_id}, but none has the "
+            f"verified Exam Date name {desired_name}. Refusing to choose or rename "
+            f"one automatically: {matches}"
+        )
+
+    # When the clinical date is still unknown, reuse a unique existing folder so
+    # an interrupted download can resume without creating a second UNKDATE copy.
+    if folder_date is None and len(matches) == 1:
+        log(f"[INFO] Reusing existing study folder while Exam Date is unknown: {matches[0]}")
         return matches[0]
+
+    if folder_date is None and len(matches) > 1:
+        raise RuntimeError(
+            f"Multiple existing folders match {patient_id} while the clinical "
+            f"Exam Date is unknown; refusing to choose one automatically: {matches}"
+        )
 
     os.makedirs(desired_path, exist_ok=True)
     log(f"Study folder: {desired_path}")
@@ -1236,13 +1297,30 @@ def normalize_exam_object(item, source="api"):
     status = str(status_value).strip() if status_value is not None else None
     reported_captures = parse_int_value(first_present(item, EXAM_CAPTURE_COUNT_KEYS))
 
+    # Parse clinical Exam Date and upload/created time independently.
+    # Do not let a recently uploaded timestamp masquerade as the exam date.
+    exam_date_dt = None
+    exam_date_raw = None
+    exam_date_key = None
+    for key in EXAM_CLINICAL_DATE_KEYS:
+        if item.get(key) not in (None, ""):
+            candidate = try_parse_date(item.get(key))
+            if candidate is not None:
+                exam_date_raw = item.get(key)
+                exam_date_dt = candidate
+                exam_date_key = key
+                break
+
     upload_dt = None
     upload_raw = None
-    for key in EXAM_DATE_KEYS:
+    upload_date_key = None
+    for key in EXAM_UPLOAD_DATE_KEYS:
         if item.get(key) not in (None, ""):
-            upload_raw = item.get(key)
-            upload_dt = try_parse_date(upload_raw)
-            if upload_dt is not None:
+            candidate = try_parse_date(item.get(key))
+            if candidate is not None:
+                upload_raw = item.get(key)
+                upload_dt = candidate
+                upload_date_key = key
                 break
 
     detail_url = first_present(item, EXAM_DETAIL_URL_KEYS)
@@ -1270,7 +1348,13 @@ def normalize_exam_object(item, source="api"):
         "reported_captures": reported_captures,
         "upload_raw": upload_raw,
         "upload_dt": upload_dt,
-        "exam_date_dt": None,
+        "upload_date_key": upload_date_key,
+        "exam_date_raw": exam_date_raw,
+        "exam_date_dt": exam_date_dt,
+        "exam_date_key": exam_date_key,
+        "exam_date_source": (
+            f"top-level API {exam_date_key}" if exam_date_dt is not None else None
+        ),
         "nested_date_dt": nested_date_dt,
         "nested_date_path": nested_date_path,
         "nested_date_score": nested_score if nested_date_dt is not None else None,
@@ -1463,15 +1547,10 @@ def enumerate_exams_html(page, last_sync_dt, stop_at_last_sync=True):
 
         records.extend(page_records)
 
-        if stop_at_last_sync and not range_mode_enabled():
-            page_dates = [
-                record["upload_dt"]
-                for record in page_records
-                if record.get("upload_dt") is not None
-            ]
-            if page_dates and min(page_dates) <= last_sync_dt:
-                log("Reached the last_sync boundary during HTML enumeration.")
-                break
+        # Do not stop HTML pagination using the table's upload/created column.
+        # It is not the clinical Exam Date and can differ substantially. The
+        # per-exam detail check in process_exam() applies the real last_sync
+        # boundary safely.
 
         page_num += 1
 
@@ -1597,13 +1676,14 @@ def hydrate_html_record(page, record):
     extra_dt = try_parse_any_date_strings(candidate_dates)
     record["patient_id"] = patient_id
     record["exam_name"] = patient_id
-    record["exam_date_dt"] = record.get("exam_date_dt") or detail_exam_dt
-    record["upload_dt"] = (
-        record.get("upload_dt")
-        or detail_upload_dt
-        or detail_exam_dt
-        or extra_dt
-    )
+    if detail_exam_dt is not None:
+        record["exam_date_dt"] = detail_exam_dt
+        record["exam_date_source"] = "Clarius Cloud Exam Date"
+    if record.get("upload_dt") is None and detail_upload_dt is not None:
+        record["upload_dt"] = detail_upload_dt
+        record["upload_date_key"] = "detail page Upload/Created"
+    # Do not use an unlabelled page-wide date (extra_dt) for naming or sync.
+    # It may be a page clock, footer timestamp, or unrelated date.
     record["exam_id"] = record.get("exam_id") or extract_exam_id_from_url(page.url)
     return record
 
@@ -1695,6 +1775,77 @@ def _trusted_capture_sync_date(capture_dt, capture_score):
     return capture_dt
 
 
+def choose_sync_date(record, capture_date_dt=None, capture_score=None):
+    """Choose the date used to compare an exam with last_sync.
+
+    Priority is deliberately clinical:
+      1. labelled/top-level clinical Exam Date;
+      2. high-confidence nested clinical metadata;
+      3. high-confidence capture acquisition metadata.
+
+    uploaded_at/created_at are never used as the sync boundary. A current upload
+    timestamp for an old exam must not make that exam look newly acquired.
+    """
+    if record.get("exam_date_dt") is not None:
+        return record.get("exam_date_dt"), (
+            record.get("exam_date_source") or "clinical exam date"
+        )
+
+    nested_dt = _trusted_nested_sync_date(record)
+    if nested_dt is not None:
+        return nested_dt, "nested clinical exam metadata"
+
+    capture_dt = _trusted_capture_sync_date(capture_date_dt, capture_score)
+    if capture_dt is not None:
+        return capture_dt, "capture acquisition metadata"
+
+    return None, None
+
+
+def choose_folder_date(record, capture_date_dt=None, capture_score=None):
+    """Choose a trustworthy clinical date for the study-folder name.
+
+    Upload/created timestamps are intentionally excluded. If all clinical
+    sources fail, return None so the folder is named UNKDATE instead of being
+    assigned a false download/upload date.
+    """
+    if record.get("exam_date_dt") is not None:
+        return record.get("exam_date_dt"), (
+            record.get("exam_date_source") or "clinical exam date"
+        )
+
+    candidates = []
+    if (
+        record.get("nested_date_dt") is not None
+        and (record.get("nested_date_score") or 0) >= MIN_FOLDER_DATE_FALLBACK_SCORE
+    ):
+        candidates.append((
+            record.get("nested_date_score") or 0,
+            record.get("nested_date_dt"),
+            "nested clinical exam metadata",
+        ))
+
+    if (
+        USE_CAPTURE_DATE_FOR_FOLDER_NAME
+        and capture_date_dt is not None
+        and (capture_score or 0) >= MIN_FOLDER_DATE_FALLBACK_SCORE
+    ):
+        candidates.append((
+            capture_score or 0,
+            capture_date_dt,
+            "capture acquisition metadata",
+        ))
+
+    if not candidates:
+        return None, None
+
+    # Highest-confidence source wins. On an exact score tie, prefer the earlier
+    # time because acquisition typically precedes later processing metadata.
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    _, dt, source = candidates[0]
+    return dt, source
+
+
 def _detail_date_conflicts_with_trusted_json(detail_dt, record):
     """Detect the characteristic 'page clock parsed as Exam Date' failure."""
     nested_dt = _trusted_nested_sync_date(record)
@@ -1777,17 +1928,24 @@ def hydrate_api_record_from_direct_detail_page(page, record):
                     pass
 
             record["detail_url"] = page.url
-            record["exam_date_dt"] = record.get("exam_date_dt") or exam_dt
-            record["upload_dt"] = record.get("upload_dt") or upload_dt or exam_dt
+            if exam_dt is not None:
+                # A labelled Cloud "Exam Date" is authoritative for folder naming
+                # and normal-sync filtering. It intentionally overrides weaker
+                # top-level/nested fallbacks, but never overwrites upload_dt.
+                record["exam_date_dt"] = exam_dt
+                record["exam_date_source"] = "Clarius Cloud Exam Date"
+            if record.get("upload_dt") is None and upload_dt is not None:
+                record["upload_dt"] = upload_dt
+                record["upload_date_key"] = "detail page Upload/Created"
 
             discovered = _template_from_successful_detail_url(page.url, exam_id)
             if discovered:
                 _DISCOVERED_EXAM_DETAIL_URL_TEMPLATE = discovered
 
             log(
-                f"[INFO] Resolved missing date for {record.get('patient_id')} "
-                f"from direct exam detail page: "
-                f"{record.get('exam_date_dt') or record.get('upload_dt')}"
+                f"[INFO] Resolved date for {record.get('patient_id')} from "
+                f"direct exam detail page: exam_date={record.get('exam_date_dt')}, "
+                f"upload_date={record.get('upload_dt')}"
             )
             return record
         except Exception:
@@ -1870,13 +2028,20 @@ def match_html_record_for_api_record(api_record, html_records):
 
 
 def hydrate_missing_api_date_from_html(page, record):
-    """Resolve a missing API date without repeatedly scanning a broken UI."""
-    if record.get("upload_dt") is not None or not HTML_DETAIL_DATE_FALLBACK:
+    """Resolve the clinical Exam Date without confusing it with upload time.
+
+    Even when the list API already supplied uploaded_at/created_at, we still try
+    the direct detail page if the clinical Exam Date is missing. This is what
+    prevents a folder downloaded on Aug 28 from being named Aug_28 when Cloud's
+    Exam Date is Aug 21 or Aug 6.
+    """
+    if not HTML_DETAIL_DATE_FALLBACK:
         return record
 
     # Preferred path for the new UI: use exam_id to open a detail page directly.
-    record = hydrate_api_record_from_direct_detail_page(page, record)
-    if record.get("upload_dt") is not None:
+    if record.get("exam_date_dt") is None:
+        record = hydrate_api_record_from_direct_detail_page(page, record)
+    if record.get("exam_date_dt") is not None:
         return record
 
     # Final legacy fallback. This is attempted no more than once per run.
@@ -1899,20 +2064,23 @@ def hydrate_missing_api_date_from_html(page, record):
 
     hydrated = hydrate_html_record(page, dict(html_record))
     record["detail_url"] = record.get("detail_url") or hydrated.get("detail_url")
-    record["exam_date_dt"] = hydrated.get("exam_date_dt")
-    record["upload_dt"] = hydrated.get("upload_dt")
+    if hydrated.get("exam_date_dt") is not None:
+        record["exam_date_dt"] = hydrated.get("exam_date_dt")
+        record["exam_date_source"] = "Clarius Cloud Exam Date"
+    if record.get("upload_dt") is None and hydrated.get("upload_dt") is not None:
+        record["upload_dt"] = hydrated.get("upload_dt")
     record["exam_id"] = record.get("exam_id") or hydrated.get("exam_id")
 
-    resolved = record.get("exam_date_dt") or record.get("upload_dt")
+    resolved = record.get("exam_date_dt")
     if resolved is not None:
         log(
-            f"[INFO] Resolved missing date for {record.get('patient_id')} "
+            f"[INFO] Resolved clinical Exam Date for {record.get('patient_id')} "
             f"from HTML exam details: {resolved}"
         )
     else:
         log(
-            f"[WARN] HTML detail page was found, but no readable date was "
-            f"extracted for {record.get('patient_id')}."
+            f"[WARN] HTML detail page was found, but no trustworthy clinical "
+            f"Exam Date was extracted for {record.get('patient_id')}."
         )
     return record
 
@@ -1944,33 +2112,38 @@ def lookup_exams_by_patient(api_ctx, patient_id):
     return deduplicate_exam_records(records)
 
 
-def choose_exam_id_from_lookup(records, upload_dt):
+def choose_exam_id_from_lookup(records, target_dt):
     candidates = []
     for record in records:
         exam_id = record.get("exam_id")
         if exam_id is None:
             continue
         status = str(record.get("status") or "").strip().lower()
-        candidates.append((exam_id, record.get("upload_dt"), status))
+        candidate_dt = (
+            record.get("exam_date_dt")
+            or _trusted_nested_sync_date(record)
+            or record.get("upload_dt")
+        )
+        candidates.append((exam_id, candidate_dt, status))
 
     if not candidates:
         return None
     if len(candidates) == 1:
         return candidates[0][0]
 
-    if upload_dt is not None:
+    if target_dt is not None:
         dated = [candidate for candidate in candidates if candidate[1] is not None]
         if dated:
             dated.sort(
                 key=lambda candidate: (
                     0 if candidate[2] in {"completed", "complete"} else 1,
-                    abs((candidate[1] - upload_dt).total_seconds()),
+                    abs((candidate[1] - target_dt).total_seconds()),
                 )
             )
             selected = dated[0]
             log(
                 f"[INFO] Multiple exams matched; selected exam_id={selected[0]} "
-                f"using the closest date to {upload_dt}."
+                f"using the closest clinical/date fallback to {target_dt}."
             )
             return selected[0]
 
@@ -1992,7 +2165,12 @@ def resolve_exam_id(api_ctx, record):
 
     log(f"[INFO] Looking up exam ID for patient {patient_id} through /exams/.")
     matches = lookup_exams_by_patient(api_ctx, patient_id)
-    exam_id = choose_exam_id_from_lookup(matches, record.get("upload_dt"))
+    target_dt = (
+        record.get("exam_date_dt")
+        or _trusted_nested_sync_date(record)
+        or record.get("upload_dt")
+    )
+    exam_id = choose_exam_id_from_lookup(matches, target_dt)
     if exam_id is None:
         raise RuntimeError(f"No exam ID could be resolved for patient {patient_id}.")
     return exam_id
@@ -2225,10 +2403,10 @@ def exam_is_new_enough(record, last_sync_dt):
     if range_mode_enabled():
         return in_patient_range(record.get("patient_id"))
 
-    upload_dt = record.get("upload_dt") or _trusted_nested_sync_date(record)
-    if upload_dt is None:
+    sync_dt, _ = choose_sync_date(record)
+    if sync_dt is None:
         return False
-    return upload_dt > last_sync_dt
+    return sync_dt > last_sync_dt
 
 
 def process_exam(page, download_page, api_ctx, record, last_sync_dt, processed_exam_ids):
@@ -2262,21 +2440,15 @@ def process_exam(page, download_page, api_ctx, record, last_sync_dt, processed_e
     if range_mode_enabled() and not in_patient_range(patient_id):
         return False, True
 
-    # API list responses may omit dates. First try the *strictly labelled*
-    # detail-page fields. If those are unavailable, use trusted nested JSON.
-    # Only if both fail do we fetch capture metadata before deciding whether
-    # the exam is newer than last_sync.
-    if record.get("upload_dt") is None:
+    # Resolve the clinical Exam Date before the sync decision and folder naming.
+    # This must run even if the list API has uploaded_at/created_at; those fields
+    # describe Cloud ingestion/updates and can be days or months later than the
+    # actual exam shown in the Cloud UI.
+    if record.get("exam_date_dt") is None:
         record = hydrate_missing_api_date_from_html(page, record)
         patient_id = record.get("patient_id") or patient_id
 
-    sync_filter_dt = record.get("upload_dt") or _trusted_nested_sync_date(record)
-    sync_filter_source = (
-        "top-level/detail date"
-        if record.get("upload_dt") is not None
-        else "nested exam JSON" if sync_filter_dt is not None
-        else None
-    )
+    sync_filter_dt, sync_filter_source = choose_sync_date(record)
 
     exam_id = None
     captures = None
@@ -2294,12 +2466,9 @@ def process_exam(page, download_page, api_ctx, record, last_sync_dt, processed_e
             capture_date_dt, capture_date_path, capture_raw, capture_score = (
                 best_date_from_captures(captures)
             )
-            trusted_capture_dt = _trusted_capture_sync_date(
-                capture_date_dt, capture_score
+            sync_filter_dt, sync_filter_source = choose_sync_date(
+                record, capture_date_dt, capture_score
             )
-            if trusted_capture_dt is not None:
-                sync_filter_dt = trusted_capture_dt
-                sync_filter_source = "capture metadata"
             if capture_date_dt is not None and DEBUG_DATE_RESOLUTION:
                 log(
                     f"[DATE DEBUG] Capture fallback for {patient_id}: "
@@ -2326,7 +2495,6 @@ def process_exam(page, download_page, api_ctx, record, last_sync_dt, processed_e
             return False, True
 
     selected_as_new = True
-    upload_dt = record.get("upload_dt") or sync_filter_dt
 
     # Resolve exam_id and fetch capture metadata before creating the folder.
     # Reuse metadata already fetched for the normal-sync date decision.
@@ -2352,41 +2520,17 @@ def process_exam(page, download_page, api_ctx, record, last_sync_dt, processed_e
                 f"(score={capture_score}, raw={capture_raw!r})"
             )
 
-    # Choose the highest-confidence JSON/capture fallback rather than always
-    # preferring an upload timestamp. For example, capture.acquired_at should
-    # beat exam.uploaded_at when both are available.
-    fallback_candidates = []
-    if record.get("nested_date_dt") is not None:
-        fallback_candidates.append((
-            record.get("nested_date_score") or 0,
-            record.get("nested_date_dt"),
-            "nested exam JSON",
-        ))
-    if capture_date_dt is not None:
-        fallback_candidates.append((
-            capture_score or 0,
-            capture_date_dt,
-            "capture metadata",
-        ))
-
-    best_fallback_dt = None
-    best_fallback_source = None
-    if fallback_candidates:
-        fallback_candidates.sort(key=lambda item: (item[0], -item[1].timestamp()), reverse=True)
-        _, best_fallback_dt, best_fallback_source = fallback_candidates[0]
-
-    folder_dt = record.get("exam_date_dt") or best_fallback_dt or upload_dt
+    # Choose the folder date independently from upload/created timestamps.
+    folder_dt, date_source = choose_folder_date(
+        record, capture_date_dt, capture_score
+    )
     if folder_dt is None:
         log(
-            f"[WARN] No readable date for {patient_id} after detail-page, "
-            "nested-JSON, and capture-metadata fallbacks; using UNKDATE."
+            f"[WARN] No trustworthy clinical Exam Date for {patient_id} after "
+            "Cloud detail-page, nested clinical metadata, and capture-acquisition "
+            "fallbacks; using UNKDATE rather than an upload/created date."
         )
     else:
-        date_source = (
-            "exam detail" if record.get("exam_date_dt") is not None
-            else best_fallback_source if best_fallback_source is not None
-            else "top-level exam API date"
-        )
         log(f"[INFO] Folder date for {patient_id}: {folder_dt} ({date_source})")
 
     study_path = get_or_create_study_path(
@@ -2405,7 +2549,8 @@ def process_exam(page, download_page, api_ctx, record, last_sync_dt, processed_e
 
     log(
         f"Processing exam_id={exam_id} patient_id={patient_id} "
-        f"status={record.get('status')} date={upload_dt}"
+        f"status={record.get('status')} exam_date={folder_dt} "
+        f"upload_date={record.get('upload_dt')}"
     )
 
     log(
@@ -2597,7 +2742,11 @@ def main():
 
             # Prefer newest exams first when dates are available.
             records.sort(
-                key=lambda record: record.get("upload_dt") or datetime.min,
+                key=lambda record: (
+                    record.get("exam_date_dt")
+                    or record.get("upload_dt")
+                    or datetime.min
+                ),
                 reverse=True,
             )
 
@@ -2630,8 +2779,8 @@ def main():
                 if (
                     patient_id
                     and not range_mode_enabled()
-                    and record.get("upload_dt") is not None
-                    and record["upload_dt"] <= last_sync_dt
+                    and record.get("exam_date_dt") is not None
+                    and record["exam_date_dt"] <= last_sync_dt
                 ):
                     continue
 
