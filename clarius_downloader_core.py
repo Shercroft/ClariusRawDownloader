@@ -8,6 +8,10 @@ This script logs in to Clarius Cloud, finds exams for one institution and one
 study, retrieves each exam's capture UUIDs, and downloads every available RAW
 archive into the research drive.
 
+DATE SOURCE NOTE (v11): The Clarius exams API field ``start_datetime`` is
+treated as the canonical Exam Date used for normal-sync filtering and folder
+naming. Detail-page date scraping is fallback-only.
+
 This version intentionally uses Playwright only. It does NOT require the
 third-party ``requests`` package.
 
@@ -347,6 +351,25 @@ DETAIL_PAGE_CONFLICT_DAYS = 1
 # for the first small-range test and can be turned off after validation.
 DEBUG_DATE_RESOLUTION = True
 
+# Force the Clarius web UI to render numeric dates in a deterministic order.
+# The folder-name parser treats slash dates as M/D/Y because that is how the
+# production Clarius UI is displayed (for example 8/12/26 = Aug 12, 2026).
+# Without an explicit browser locale, Playwright may inherit an en-CA/en-GB
+# locale and render the same date as 12/8/26; parsing that as M/D/Y produces
+# the false Dec_08 folder bug.
+CLOUD_BROWSER_LOCALE = "en-US"
+
+# Completed clinical exams should not have dates materially in the future.
+# A small allowance protects against timezone/clock skew while rejecting
+# month/day inversions such as Dec 8 when the true date is Aug 12.
+CLINICAL_DATE_FUTURE_ALLOWANCE_DAYS = 2
+
+# Developer test mode. When True, the downloader resolves each selected exam's
+# clinical date and prints the folder name it *would* use, but it does not create,
+# rename, or download any study folders and it never advances last_sync. This is
+# intended for source-code testing between packaged releases.
+DATE_AUDIT_ONLY = False
+
 # =====================================================================
 # 2. BROWSER / PLAYWRIGHT REQUEST CONTROLS
 # =====================================================================
@@ -433,6 +456,16 @@ EXAM_CAPTURE_COUNT_KEYS = ["number_of_captures", "capture_count", "num_captures"
 # Folder names and the normal-sync boundary should use the clinical exam date
 # whenever it is available. Upload/created timestamps are only fallbacks.
 EXAM_CLINICAL_DATE_KEYS = [
+    # The current Clarius exams API exposes the UI "Exam Date" as
+    # start_datetime. This is the most reliable source we have: the run logs
+    # show it matches the All Exams table exactly (P403, P254, P184, P247).
+    # Keep it ahead of scraped detail-page dates, whose numeric display can be
+    # locale-reformatted (e.g. Aug 12 rendered as 12/08/2026).
+    "start_datetime",
+    "startDateTime",
+    "start_date_time",
+    "startDate",
+    "start_date",
     "exam_date",
     "examDate",
     "study_date",
@@ -676,6 +709,9 @@ _DATE_EXCLUDE_WORDS = {
 }
 
 _DATE_KEY_WEIGHTS = {
+    # Clarius API: start_datetime is the canonical Exam Date shown in All Exams.
+    "start_datetime": 140, "startdatetime": 140, "start_date_time": 140,
+    "start_date": 135, "startdate": 135,
     "exam_date": 120, "examdate": 120,
     "acquired_at": 115, "acquiredat": 115, "acquisition_date": 115,
     "acquisitiondate": 115, "capture_date": 110, "capturedate": 110,
@@ -704,11 +740,37 @@ def _date_key_score(path):
     return score
 
 
-def _plausible_clinical_date(dt):
+def _plausible_clinical_date(dt, reference_dt=None):
+    """Return True only for a believable completed-exam datetime.
+
+    In addition to a broad lower bound, reject dates more than a small amount
+    into the future. This catches the characteristic numeric day/month swap
+    (for example 12/8/26 -> Dec 8) when the actual Cloud date is 8/12/26
+    (Aug 12).
+    """
     if dt is None:
         return False
-    current_year = datetime.now().year
-    return 2010 <= dt.year <= current_year + 1
+
+    reference_dt = reference_dt or datetime.now()
+    if dt.year < 2010:
+        return False
+
+    latest_allowed = reference_dt + timedelta(days=CLINICAL_DATE_FUTURE_ALLOWANCE_DAYS)
+    return dt <= latest_allowed
+
+
+def _validated_clinical_date(dt, *, source=None, raw=None):
+    """Reject impossible clinical dates and log enough detail to debug them."""
+    if dt is None:
+        return None
+    if _plausible_clinical_date(dt):
+        return dt
+    if DEBUG_DATE_RESOLUTION:
+        log(
+            f"[DATE DEBUG] Rejected implausible future clinical date {dt}"
+            f" from {source or 'unknown source'}; raw={raw!r}"
+        )
+    return None
 
 
 def find_date_candidates_in_json(payload, max_depth=8):
@@ -1298,6 +1360,9 @@ def normalize_exam_object(item, source="api"):
     reported_captures = parse_int_value(first_present(item, EXAM_CAPTURE_COUNT_KEYS))
 
     # Parse clinical Exam Date and upload/created time independently.
+    # IMPORTANT: Clarius currently supplies the visible All Exams "Exam Date"
+    # in start_datetime. Prefer that API value over DOM/detail-page text because
+    # the latter can be rendered in D/M/Y while the All Exams UI is M/D/Y.
     # Do not let a recently uploaded timestamp masquerade as the exam date.
     exam_date_dt = None
     exam_date_raw = None
@@ -1305,10 +1370,21 @@ def normalize_exam_object(item, source="api"):
     for key in EXAM_CLINICAL_DATE_KEYS:
         if item.get(key) not in (None, ""):
             candidate = try_parse_date(item.get(key))
+            candidate = _validated_clinical_date(
+                candidate, source=f"top-level {key}", raw=item.get(key)
+            )
             if candidate is not None:
                 exam_date_raw = item.get(key)
                 exam_date_dt = candidate
                 exam_date_key = key
+                if DEBUG_DATE_RESOLUTION and key in {
+                    "start_datetime", "startDateTime", "start_date_time",
+                    "startDate", "start_date",
+                }:
+                    log(
+                        f"[DATE DEBUG] Canonical Clarius Exam Date for {patient_id}: "
+                        f"{candidate} from top-level {key} (raw={item.get(key)!r})"
+                    )
                 break
 
     upload_dt = None
@@ -1562,6 +1638,130 @@ def enumerate_exams_html(page, last_sync_dt, stop_at_last_sync=True):
     return records
 
 
+def _extract_labeled_date_from_text(text, labels):
+    """Extract a date only when it is explicitly associated with a label.
+
+    This helper is intentionally conservative. It never scans arbitrary dates in
+    the text. It accepts either ``Exam Date: <value>`` on one line or an exact
+    label line followed by the value on one of the next three non-empty lines.
+    """
+    if not text:
+        return None
+
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    normalized_labels = {
+        normalize_clarius_datetime_text(label).rstrip(":").strip().lower()
+        for label in labels
+    }
+
+    for i, line in enumerate(lines):
+        normalized = normalize_clarius_datetime_text(line).strip()
+        lowered = normalized.lower()
+
+        # Same-line forms such as "Exam Date: 8/21/26, 7:37 AM".
+        for label in normalized_labels:
+            if lowered == label or lowered == label + ":":
+                for candidate in lines[i + 1 : i + 4]:
+                    if len(candidate) > 120:
+                        continue
+                    parsed = _validated_clinical_date(
+                        try_parse_date(candidate),
+                        source="labelled Cloud detail text",
+                        raw=candidate,
+                    )
+                    if parsed is not None:
+                        return parsed
+                continue
+
+            prefixes = (label + ":", label + " ")
+            if lowered.startswith(prefixes):
+                # Use the original normalized text to preserve AM/PM etc.
+                suffix = normalized[len(label):].lstrip(" :\t-")
+                if suffix and len(suffix) <= 120:
+                    parsed = _validated_clinical_date(
+                        try_parse_date(suffix),
+                        source="labelled Cloud detail text",
+                        raw=suffix,
+                    )
+                    if parsed is not None:
+                        return parsed
+
+    return None
+
+
+def _url_path_contains_exam_id(url, exam_id):
+    """True only when the *path*, not merely a query string, identifies exam_id."""
+    if not url or exam_id is None:
+        return False
+    path_parts = [part for part in urlparse(str(url)).path.split("/") if part]
+    return str(exam_id) in path_parts
+
+
+def _xpath_literal(value):
+    """Return an XPath string literal for arbitrary text."""
+    value = str(value)
+    if "'" not in value:
+        return "'" + value + "'"
+    if '"' not in value:
+        return '"' + value + '"'
+    parts = value.split("'")
+    quoted = [("'" + part + "'") for part in parts]
+    return "concat(" + ", \"'\", ".join(quoted) + ")"
+
+
+def try_read_patient_scoped_detail_date(page, patient_id, labels):
+    """Read a labelled date from the smallest DOM region containing patient_id.
+
+    Clarius can redirect an unsupported exam-detail URL back to the institution
+    exam list. A page-wide ``Exam Date`` lookup on that list reads the first row
+    and can therefore assign today's date (or another patient's date) to every
+    exam. This function anchors the lookup to the exact patient identifier first
+    and parses the date only from a nearby ancestor containing that same patient.
+    """
+    patient_id = str(patient_id or "").strip()
+    if not patient_id:
+        return None
+
+    try:
+        patient_nodes = page.locator(
+            "xpath=//*[normalize-space(text())=" + _xpath_literal(patient_id) + "]"
+        )
+        count = min(patient_nodes.count(), 20)
+    except Exception:
+        return None
+
+    for index in range(count):
+        node = patient_nodes.nth(index)
+        # Smallest useful ancestor first. This handles table rows, cards, and
+        # detail panes without assuming one specific Clarius DOM version.
+        for depth in range(1, 8):
+            try:
+                scope = node.locator(f"xpath=ancestor::*[{depth}]")
+                if scope.count() <= 0:
+                    continue
+                text = scope.first.inner_text().strip()
+            except Exception:
+                continue
+
+            if not text or patient_id not in text:
+                continue
+            if len(text) > 20000:
+                # We have reached a page-level container; do not let the parser
+                # drift to another patient's Exam Date.
+                break
+
+            dt = _extract_labeled_date_from_text(text, labels)
+            if dt is not None:
+                if DEBUG_DATE_RESOLUTION:
+                    log(
+                        f"[DATE DEBUG] Patient-scoped detail date for {patient_id}: "
+                        f"{dt} (ancestor depth={depth})"
+                    )
+                return dt
+
+    return None
+
+
 def try_read_detail_date(page, labels):
     """Read a *labelled* date from the exam detail page.
 
@@ -1584,7 +1784,11 @@ def try_read_detail_date(page, labels):
                 raw = loc.first.inner_text().strip()
                 if not raw or len(raw) > 120 or "\n" in raw:
                     continue
-                parsed = try_parse_date(raw)
+                parsed = _validated_clinical_date(
+                    try_parse_date(raw),
+                    source=f"exact Cloud detail label {label}",
+                    raw=raw,
+                )
                 if parsed is not None:
                     if DEBUG_DATE_RESOLUTION:
                         log(
@@ -1611,7 +1815,11 @@ def try_read_detail_date(page, labels):
             for candidate in lines[i + 1 : i + 4]:
                 if len(candidate) > 120:
                     continue
-                parsed = try_parse_date(candidate)
+                parsed = _validated_clinical_date(
+                    try_parse_date(candidate),
+                    source=f"Cloud detail text-line {line}",
+                    raw=candidate,
+                )
                 if parsed is not None:
                     if DEBUG_DATE_RESOLUTION:
                         log(
@@ -1888,11 +2096,27 @@ def hydrate_api_record_from_direct_detail_page(page, record):
                 except Exception:
                     pass
 
-            exam_dt = try_read_detail_date(page, ["Exam Date", "Acquired Date"])
-            upload_dt = try_read_detail_date(
-                page,
-                ["Upload Date", "Uploaded", "Created"],
+            # Prefer a patient-scoped lookup. This remains safe even when a
+            # candidate URL redirects back to the institution exam list because
+            # the date must come from the DOM region containing this exact patient.
+            exam_dt = try_read_patient_scoped_detail_date(
+                page, patient_id, ["Exam Date", "Acquired Date"]
             )
+            upload_dt = try_read_patient_scoped_detail_date(
+                page, patient_id, ["Upload Date", "Uploaded", "Created"]
+            )
+
+            # A global detail-card lookup is allowed only when the final URL path
+            # itself identifies this exam. Query-string/list URLs are not enough;
+            # that was the remaining cause of Aug_28 being assigned to many old
+            # studies when Clarius redirected to the exam list.
+            path_is_exam_specific = _url_path_contains_exam_id(page.url, exam_id)
+            if exam_dt is None and path_is_exam_specific:
+                exam_dt = try_read_detail_date(page, ["Exam Date", "Acquired Date"])
+            if upload_dt is None and path_is_exam_specific:
+                upload_dt = try_read_detail_date(
+                    page, ["Upload Date", "Uploaded", "Created"]
+                )
 
             if _detail_date_conflicts_with_trusted_json(exam_dt, record):
                 log(
@@ -1919,13 +2143,25 @@ def hydrate_api_record_from_direct_detail_page(page, record):
                 continue
 
             # Guard against accidentally parsing a date from an unrelated page.
-            if patient_id:
-                try:
-                    body_text = page.locator("body").inner_text()
-                    if patient_id not in body_text and "Exam Date" not in body_text:
-                        continue
-                except Exception:
-                    pass
+            # The old condition used ``patient missing AND Exam Date missing``,
+            # which still accepted a generic list page merely because the words
+            # "Exam Date" appeared somewhere on it. Require the exact patient.
+            try:
+                body_text = page.locator("body").inner_text()
+            except Exception:
+                body_text = ""
+            if patient_id and patient_id not in body_text:
+                if DEBUG_DATE_RESOLUTION:
+                    log(
+                        f"[DATE DEBUG] Rejected candidate page for {patient_id}: "
+                        f"patient ID not present. requested={detail_url}, final={page.url}"
+                    )
+                continue
+
+            # If this is not an exam-specific path, only the patient-scoped
+            # parser may provide the clinical date. Never use a page-global date.
+            if not path_is_exam_specific and exam_dt is None:
+                continue
 
             record["detail_url"] = page.url
             if exam_dt is not None:
@@ -1938,7 +2174,9 @@ def hydrate_api_record_from_direct_detail_page(page, record):
                 record["upload_dt"] = upload_dt
                 record["upload_date_key"] = "detail page Upload/Created"
 
-            discovered = _template_from_successful_detail_url(page.url, exam_id)
+            discovered = None
+            if path_is_exam_specific:
+                discovered = _template_from_successful_detail_url(page.url, exam_id)
             if discovered:
                 _DISCOVERED_EXAM_DETAIL_URL_TEMPLATE = discovered
 
@@ -2038,7 +2276,10 @@ def hydrate_missing_api_date_from_html(page, record):
     if not HTML_DETAIL_DATE_FALLBACK:
         return record
 
-    # Preferred path for the new UI: use exam_id to open a detail page directly.
+    # Preferred path for the new UI: use the API start_datetime whenever present.
+    # Only scrape a detail page when the API genuinely has no clinical start date.
+    # This prevents locale-reformatted detail text such as 12/08/2026 from
+    # overriding the correct API value 2026-08-12T14:02:01Z.
     if record.get("exam_date_dt") is None:
         record = hydrate_api_record_from_direct_detail_page(page, record)
     if record.get("exam_date_dt") is not None:
@@ -2533,6 +2774,16 @@ def process_exam(page, download_page, api_ctx, record, last_sync_dt, processed_e
     else:
         log(f"[INFO] Folder date for {patient_id}: {folder_dt} ({date_source})")
 
+    if DATE_AUDIT_ONLY:
+        intended_name = build_study_folder(patient_id, folder_dt)
+        log(
+            f"[DATE AUDIT] {patient_id} -> {intended_name}; "
+            f"exam_date={folder_dt}; source={date_source}; "
+            f"upload_date={record.get('upload_dt')}"
+        )
+        # No folder creation/rename, no RAW download, and no state advancement.
+        return selected_as_new, True
+
     study_path = get_or_create_study_path(
         MASTER_FOLDER,
         patient_id,
@@ -2716,7 +2967,9 @@ def main():
         context = browser.new_context(
             accept_downloads=True,
             viewport={"width": 1920, "height": 1080},
+            locale=CLOUD_BROWSER_LOCALE,
         )
+        log(f"[INFO] Browser locale forced to {CLOUD_BROWSER_LOCALE} for deterministic M/D/Y Cloud dates.")
         page = context.new_page()
         page.set_default_timeout(DEFAULT_TIMEOUT_MS)
 
@@ -2811,7 +3064,9 @@ def main():
             # State-update rules are deliberately conservative. Range mode is
             # isolated from routine sync state. Normal mode advances only when at
             # least one exam was selected and every selected exam completed.
-            if range_mode_enabled():
+            if DATE_AUDIT_ONLY:
+                log("[INFO] DATE AUDIT mode: no files were downloaded and last_sync was not updated.")
+            elif range_mode_enabled():
                 log("[INFO] PATIENT RANGE mode: last_sync was not updated.")
             elif selected_any and not run_had_errors:
                 save_last_sync(run_start_ts)

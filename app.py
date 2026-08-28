@@ -23,7 +23,7 @@ from typing import Any
 
 
 APP_NAME = "Clarius RAW Data Downloader"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.4"
 SETTINGS_FILENAME = "settings.json"
 
 

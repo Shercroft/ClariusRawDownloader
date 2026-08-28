@@ -1,0 +1,10 @@
+v1.2.4 / v11 date-source fix
+
+The Clarius exams API field start_datetime is now the canonical Exam Date for normal sync and folder naming.
+This is grounded in the real 2026-08-28 log:
+- P403 start_datetime -> Aug 21 07:37, matching Cloud
+- P254 start_datetime -> Aug 12 10:02, matching Cloud
+- P184 start_datetime -> Aug 06 10:43, matching Cloud
+- P247 start_datetime -> Aug 06 07:58, matching Cloud
+
+Detail-page numeric dates are fallback-only because the detail text may be rendered as D/M/Y (e.g. 12/08/2026 for Aug 12), while the visible All Exams table is M/D/Y.
